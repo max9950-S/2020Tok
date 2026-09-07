@@ -3,6 +3,14 @@ export interface CatalogVideo {
   url: string;
 }
 
+/**
+ * A single position in the feed. The same video can be dealt more than once as the
+ * deck reshuffles, so slideKey — not id — identifies a slide.
+ */
+export interface FeedSlide extends CatalogVideo {
+  slideKey: string;
+}
+
 export interface EmbedOptions {
   autoplay?: boolean;
   muted?: boolean;
@@ -66,7 +74,7 @@ export function videoUrlFromId(id: string, author?: string): string {
 }
 
 export function buildEmbedUrl(videoId: string, options: EmbedOptions = {}): string {
-  const { autoplay = true, muted = true } = options;
+  const { autoplay = true, muted = false } = options;
   const params = new URLSearchParams({
     autoplay: autoplay ? '1' : '0',
     muted: muted ? '1' : '0',
@@ -102,7 +110,7 @@ export function sendPlayerCommand(
   );
 }
 
-export function attemptUnmute(iframe: HTMLIFrameElement | null): void {
+export function unmutePlayer(iframe: HTMLIFrameElement | null): void {
   sendPlayerCommand(iframe, 'unMute');
   sendPlayerCommand(iframe, 'changeVolume', 100);
 }
@@ -120,16 +128,8 @@ export function mutePlayer(iframe: HTMLIFrameElement | null): void {
   sendPlayerCommand(iframe, 'changeVolume', 0);
 }
 
-export function silencePlayer(iframe: HTMLIFrameElement | null): void {
-  pausePlayer(iframe);
-  mutePlayer(iframe);
-}
-
-export function silenceAllTikTokPlayers(): void {
-  document.querySelectorAll<HTMLIFrameElement>('iframe[src*="tiktok.com"]').forEach((iframe) => {
-    silencePlayer(iframe);
-    iframe.src = 'about:blank';
-  });
+export function seekPlayer(iframe: HTMLIFrameElement | null, seconds: number): void {
+  sendPlayerCommand(iframe, 'seekTo', seconds);
 }
 
 export function parsePlayerMessage(data: unknown): TikTokPlayerMessage | null {

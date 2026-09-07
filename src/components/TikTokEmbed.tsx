@@ -1,30 +1,53 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react';
 import {
-  attemptUnmute,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react';
+import {
   buildEmbedUrl,
   getVideoDateParts,
+  mutePlayer,
   parsePlayerMessage,
   pausePlayer,
   playPlayer,
-  mutePlayer,
-  sendPlayerCommand,
-  silencePlayer,
+  seekPlayer,
+  unmutePlayer,
 } from '../lib/tiktok';
+import { didJustEnableSound, isSoundEnabled, subscribeSound } from '../lib/audio';
+import { usePageVisible } from '../hooks/usePageVisible';
 import { VideoDateOverlay } from './VideoDateOverlay';
+
+export type PlayerRole = 'active' | 'held' | 'queued';
 
 interface TikTokEmbedProps {
   videoId: string;
   videoUrl: string;
-  isActive: boolean;
-  activationEpoch: number;
+  role: PlayerRole;
+  gated?: boolean;
+  forcePause?: boolean;
+  nativePlay?: boolean;
+  awaitGesture?: boolean;
   registerActivePlayback?: (controls: { toggle: () => void } | null) => void;
+  unregisterActivePlayback?: (controls: { toggle: () => void }) => void;
+  registerQueuedPlayback?: (controls: { play: () => void } | null) => void;
+  unregisterQueuedPlayback?: (controls: { play: () => void }) => void;
+  onNativePlay?: () => void;
+  onReady?: () => void;
+  onUnavailable?: (videoId: string) => void;
 }
 
-const UNMUTE_RETRY_DELAYS_MS = [0, 40, 100, 200, 400, 700, 1100, 1600];
-const PLAY_RETRY_DELAYS_MS = [0, 80, 200, 450, 900, 1500, 2500, 4000, 6000, 9000];
-const READY_FALLBACK_MS = 3500;
-const UNMUTE_POLL_MS = 350;
-const UNMUTE_POLL_DURATION_MS = 12000;
+interface PlayerState {
+  playing: boolean;
+  muted: boolean;
+}
+
+const RECONCILE_BACKOFF_MS = [150, 300, 600, 1200, 2400];
+const MAX_REDRIVES_PER_INTENT = 8;
+const LOAD_RETRY_BACKOFF_MS = [700, 2000];
+const HANDSHAKE_TIMEOUT_MS = 15000;
 
 function formatTime(seconds: number): string {
   const mins = Math.floor(seconds / 60);
@@ -35,201 +58,267 @@ function formatTime(seconds: number): string {
 export function TikTokEmbed({
   videoId,
   videoUrl,
-  isActive,
-  activationEpoch,
+  role,
+  gated = false,
+  forcePause = false,
+  nativePlay = false,
+  awaitGesture = false,
   registerActivePlayback,
+  unregisterActivePlayback,
+  registerQueuedPlayback,
+  unregisterQueuedPlayback,
+  onNativePlay,
+  onReady,
+  onUnavailable,
 }: TikTokEmbedProps) {
-  const nativeRef = useRef<HTMLIFrameElement>(null);
-  const readyRef = useRef(false);
-  const isMutedRef = useRef(true);
-  const isPlayingRef = useRef(false);
-  const userPausedRef = useRef(false);
-  const playerErrorRef = useRef(false);
-  const pageHiddenRef = useRef(false);
-  const wasPlayingBeforeBackgroundRef = useRef(false);
-  const lastToggleAtRef = useRef(0);
-  const unmuteTimersRef = useRef<number[]>([]);
-  const playTimersRef = useRef<number[]>([]);
-  const isActiveRef = useRef(isActive);
-  const embedSrcRef = useRef(buildEmbedUrl(videoId, { autoplay: true, muted: true }));
-  const createdDate = useMemo(() => getVideoDateParts(videoId), [videoId]);
+  const frameRef = useRef<HTMLIFrameElement>(null);
+  const soundEnabled = useSyncExternalStore(subscribeSound, isSoundEnabled, () => false);
+  const pageVisible = usePageVisible();
+  const lastIdRef = useRef(videoId);
+  const awaitNativeTap = useRef(awaitGesture);
+  if (lastIdRef.current !== videoId) {
+    lastIdRef.current = videoId;
+    awaitNativeTap.current = awaitGesture;
+  }
 
-  isActiveRef.current = isActive;
-
-  const [iframeLoaded, setIframeLoaded] = useState(false);
+  const [loadNonce, setLoadNonce] = useState(0);
+  const [loaded, setLoaded] = useState(false);
   const [ready, setReady] = useState(false);
+  const [userPaused, setUserPaused] = useState(false);
+  const [pauseArmed, setPauseArmed] = useState(!gated);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [userPaused, setUserPaused] = useState(false);
-  const [playerError, setPlayerError] = useState(false);
 
-  readyRef.current = ready;
-  const playerVisible = iframeLoaded && !playerError;
+  const intentRef = useRef<PlayerState>({ playing: false, muted: true });
+  const reportedRef = useRef<PlayerState>({ playing: false, muted: true });
+  const attemptRef = useRef(0);
+  const redriveRef = useRef(0);
+  const reconcileTimerRef = useRef<number | null>(null);
 
-  const markReady = useCallback(() => {
-    if (readyRef.current) return;
-    readyRef.current = true;
-    setReady(true);
+  const loadedRef = useRef(false);
+  const userPausedRef = useRef(false);
+  const nativeStartedRef = useRef(false);
+  const loadAttemptRef = useRef(0);
+  const loadRetryTimerRef = useRef<number | null>(null);
+  const handshakeTimerRef = useRef<number | null>(null);
+  const unavailableRef = useRef(false);
+  const roleRef = useRef(role);
+  const gatedRef = useRef(gated);
+  const forcePauseRef = useRef(forcePause);
+  const onNativePlayRef = useRef(onNativePlay);
+  const onReadyRef = useRef(onReady);
+  const awaitGestureRef = useRef(awaitGesture);
+  roleRef.current = role;
+  gatedRef.current = gated;
+  forcePauseRef.current = forcePause;
+  onNativePlayRef.current = onNativePlay;
+  onReadyRef.current = onReady;
+  awaitGestureRef.current = awaitGesture;
+
+  const embedSrc = useMemo(
+    () => buildEmbedUrl(videoId, awaitNativeTap.current
+      ? { autoplay: false, muted: false }
+      : { autoplay: true, muted: false }),
+    [videoId],
+  );
+  const createdDate = useMemo(() => getVideoDateParts(videoId), [videoId]);
+
+  const clearReconcileTimer = useCallback(() => {
+    if (reconcileTimerRef.current === null) return;
+    window.clearTimeout(reconcileTimerRef.current);
+    reconcileTimerRef.current = null;
   }, []);
 
-  const clearUnmuteTimers = useCallback(() => {
-    unmuteTimersRef.current.forEach((timer) => window.clearTimeout(timer));
-    unmuteTimersRef.current = [];
+  const clearHandshakeTimer = useCallback(() => {
+    if (handshakeTimerRef.current === null) return;
+    window.clearTimeout(handshakeTimerRef.current);
+    handshakeTimerRef.current = null;
   }, []);
 
-  const clearPlayTimers = useCallback(() => {
-    playTimersRef.current.forEach((timer) => window.clearTimeout(timer));
-    playTimersRef.current = [];
+  const clearLoadRetryTimer = useCallback(() => {
+    if (loadRetryTimerRef.current === null) return;
+    window.clearTimeout(loadRetryTimerRef.current);
+    loadRetryTimerRef.current = null;
   }, []);
 
-  const scheduleUnmuteRetries = useCallback((iframe: HTMLIFrameElement) => {
-    clearUnmuteTimers();
-    UNMUTE_RETRY_DELAYS_MS.forEach((delay) => {
-      unmuteTimersRef.current.push(window.setTimeout(() => attemptUnmute(iframe), delay));
-    });
-  }, [clearUnmuteTimers]);
+  const notifyNativePlay = useCallback(() => {
+    if (nativeStartedRef.current) return;
+    if (!awaitGestureRef.current) return;
+    nativeStartedRef.current = true;
+    onNativePlayRef.current?.();
+  }, []);
 
-  const schedulePlayRetries = useCallback((iframe: HTMLIFrameElement) => {
-    clearPlayTimers();
-    PLAY_RETRY_DELAYS_MS.forEach((delay) => {
-      playTimersRef.current.push(window.setTimeout(() => {
-        if (
-          !isActiveRef.current
-          || pageHiddenRef.current
-          || userPausedRef.current
-          || isPlayingRef.current
-          || playerErrorRef.current
-        ) {
-          return;
-        }
-        playPlayer(iframe);
-      }, delay));
-    });
-  }, [clearPlayTimers]);
+  const reconcile = useCallback(() => {
+    clearReconcileTimer();
+    const iframe = frameRef.current;
+    if (!iframe || !loadedRef.current || unavailableRef.current) return;
+    if (roleRef.current === 'queued' || gatedRef.current) return;
 
-  const kickPlayback = useCallback((iframe: HTMLIFrameElement | null) => {
-    if (!iframe || !isActiveRef.current || pageHiddenRef.current || userPausedRef.current || playerErrorRef.current) {
+    const intent = intentRef.current;
+    const reported = reportedRef.current;
+    const playingMismatch = intent.playing !== reported.playing;
+    const mutedMismatch = intent.muted !== reported.muted;
+
+    if (!playingMismatch && !mutedMismatch) {
+      attemptRef.current = 0;
       return;
     }
-    playPlayer(iframe);
-    schedulePlayRetries(iframe);
-  }, [schedulePlayRetries]);
+    if (attemptRef.current >= RECONCILE_BACKOFF_MS.length) return;
 
-  const pauseForPageBackground = useCallback(() => {
-    if (pageHiddenRef.current) return;
-    pageHiddenRef.current = true;
-    wasPlayingBeforeBackgroundRef.current = Boolean(
-      isActive && iframeLoaded && !playerErrorRef.current && !userPausedRef.current && isPlayingRef.current,
-    );
-    pausePlayer(nativeRef.current);
-    isPlayingRef.current = false;
-    setIsPlaying(false);
-    clearPlayTimers();
-    clearUnmuteTimers();
-  }, [clearPlayTimers, clearUnmuteTimers, iframeLoaded, isActive]);
+    if (playingMismatch) {
+      if (intent.playing) playPlayer(iframe);
+      else pausePlayer(iframe);
+    }
+    if (mutedMismatch) {
+      if (intent.muted) mutePlayer(iframe);
+      else unmutePlayer(iframe);
+    }
 
-  const resumeFromPageBackground = useCallback(() => {
-    if (!pageHiddenRef.current) return;
-    pageHiddenRef.current = false;
-    if (
-      !isActive
-      || !iframeLoaded
-      || playerErrorRef.current
-      || userPausedRef.current
-      || !wasPlayingBeforeBackgroundRef.current
-    ) {
-      wasPlayingBeforeBackgroundRef.current = false;
+    const delay = RECONCILE_BACKOFF_MS[attemptRef.current];
+    attemptRef.current += 1;
+    reconcileTimerRef.current = window.setTimeout(() => {
+      reconcileTimerRef.current = null;
+      reconcile();
+    }, delay);
+  }, [clearReconcileTimer]);
+
+  const setIntent = useCallback((next: PlayerState) => {
+    const current = intentRef.current;
+    if (current.playing === next.playing && current.muted === next.muted) return;
+    intentRef.current = next;
+    attemptRef.current = 0;
+    redriveRef.current = 0;
+    reconcile();
+  }, [reconcile]);
+
+  const syncReported = useCallback((patch: Partial<PlayerState>) => {
+    const previous = reportedRef.current;
+    const next = { ...previous, ...patch };
+    if (next.playing === previous.playing && next.muted === next.muted) return;
+    reportedRef.current = next;
+
+    if (next.playing) notifyNativePlay();
+
+    const intent = intentRef.current;
+    if (intent.playing === next.playing && intent.muted === next.muted) {
+      attemptRef.current = 0;
+      clearReconcileTimer();
       return;
     }
-    wasPlayingBeforeBackgroundRef.current = false;
-    const iframe = nativeRef.current;
-    kickPlayback(iframe);
-    if (iframe) {
-      attemptUnmute(iframe);
-      scheduleUnmuteRetries(iframe);
+    if (reconcileTimerRef.current !== null) return;
+    if (redriveRef.current >= MAX_REDRIVES_PER_INTENT) return;
+    redriveRef.current += 1;
+    attemptRef.current = 0;
+    reconcile();
+  }, [clearReconcileTimer, notifyNativePlay, reconcile]);
+
+  const failLoad = useCallback((reason: 'error' | 'silent') => {
+    if (unavailableRef.current) return;
+    clearHandshakeTimer();
+    clearReconcileTimer();
+    clearLoadRetryTimer();
+
+    if (reason === 'silent' && roleRef.current === 'queued') {
+      return;
     }
-  }, [iframeLoaded, isActive, kickPlayback, scheduleUnmuteRetries]);
+
+    const maxAttempts = reason === 'error' ? LOAD_RETRY_BACKOFF_MS.length : 1;
+    if (loadAttemptRef.current < maxAttempts) {
+      const delay = LOAD_RETRY_BACKOFF_MS[Math.min(loadAttemptRef.current, LOAD_RETRY_BACKOFF_MS.length - 1)];
+      loadAttemptRef.current += 1;
+      loadRetryTimerRef.current = window.setTimeout(() => {
+        loadRetryTimerRef.current = null;
+        loadedRef.current = false;
+        reportedRef.current = { playing: false, muted: true };
+        setLoaded(false);
+        setReady(false);
+        setLoadNonce((nonce) => nonce + 1);
+      }, delay);
+      return;
+    }
+
+    if (reason !== 'error') return;
+    unavailableRef.current = true;
+    onUnavailable?.(videoId);
+  }, [clearHandshakeTimer, clearLoadRetryTimer, clearReconcileTimer, onUnavailable, videoId]);
 
   useEffect(() => {
-    readyRef.current = false;
-    isMutedRef.current = true;
-    isPlayingRef.current = false;
+    loadedRef.current = false;
     userPausedRef.current = false;
-    playerErrorRef.current = false;
-    clearUnmuteTimers();
-    clearPlayTimers();
-    setIframeLoaded(false);
+    nativeStartedRef.current = false;
+    unavailableRef.current = false;
+    loadAttemptRef.current = 0;
+    attemptRef.current = 0;
+    redriveRef.current = 0;
+    intentRef.current = { playing: false, muted: true };
+    reportedRef.current = { playing: false, muted: true };
+    setLoaded(false);
     setReady(false);
+    setUserPaused(false);
+    setPauseArmed(false);
     setCurrentTime(0);
     setDuration(0);
-    setIsPlaying(false);
-    setUserPaused(false);
-    setPlayerError(false);
     return () => {
-      silencePlayer(nativeRef.current);
-      if (nativeRef.current) nativeRef.current.src = 'about:blank';
-      clearUnmuteTimers();
-      clearPlayTimers();
+      clearReconcileTimer();
+      clearHandshakeTimer();
+      clearLoadRetryTimer();
     };
-  }, [clearPlayTimers, clearUnmuteTimers, videoId]);
+  }, [clearHandshakeTimer, clearLoadRetryTimer, clearReconcileTimer, videoId]);
 
   useEffect(() => {
-    if (isActive) return;
-    silencePlayer(nativeRef.current);
-    isPlayingRef.current = false;
-    setIsPlaying(false);
-    clearPlayTimers();
-    clearUnmuteTimers();
-    nativeRef.current?.blur();
-  }, [clearPlayTimers, clearUnmuteTimers, isActive]);
-
-  useEffect(() => {
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') pauseForPageBackground();
-      else resumeFromPageBackground();
-    };
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    window.addEventListener('pagehide', pauseForPageBackground);
-    return () => {
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-      window.removeEventListener('pagehide', pauseForPageBackground);
-    };
-  }, [pauseForPageBackground, resumeFromPageBackground]);
-
-  useEffect(() => {
-    if (!isActive || playerErrorRef.current) return;
-    userPausedRef.current = false;
-    isPlayingRef.current = false;
-    setUserPaused(false);
-    setIsPlaying(false);
-    const iframe = nativeRef.current;
-    if (iframe && iframeLoaded) {
-      kickPlayback(iframe);
-      attemptUnmute(iframe);
-      scheduleUnmuteRetries(iframe);
+    if (gated) {
+      setPauseArmed(false);
+      return;
     }
-  }, [activationEpoch, iframeLoaded, isActive, kickPlayback, scheduleUnmuteRetries]);
-
-  useEffect(() => {
-    if (!isActive || !iframeLoaded || playerErrorRef.current || userPausedRef.current) return;
-    kickPlayback(nativeRef.current);
-    attemptUnmute(nativeRef.current);
-  }, [iframeLoaded, isActive, kickPlayback]);
-
-  useEffect(() => {
-    if (!iframeLoaded || ready || playerErrorRef.current) return;
-    const timer = window.setTimeout(() => {
-      if (!readyRef.current && !playerErrorRef.current && isActive) {
-        markReady();
-        kickPlayback(nativeRef.current);
-      }
-    }, READY_FALLBACK_MS);
+    const timer = window.setTimeout(() => setPauseArmed(true), 600);
     return () => window.clearTimeout(timer);
-  }, [iframeLoaded, isActive, kickPlayback, markReady, ready, videoId]);
+  }, [gated]);
 
   useEffect(() => {
-    const iframe = nativeRef.current;
+    if (unavailableRef.current) {
+      setIntent({ playing: false, muted: true });
+      return;
+    }
+    if (role === 'queued') {
+      if (nativePlay) {
+        unmutePlayer(frameRef.current);
+        return;
+      }
+      if (awaitGesture) return;
+      nativeStartedRef.current = false;
+      userPausedRef.current = false;
+      pausePlayer(frameRef.current);
+      return;
+    }
+    if (gated) {
+      return;
+    }
+    if (role === 'held') {
+      pausePlayer(frameRef.current);
+      return;
+    }
+    if (forcePause) {
+      return;
+    }
+    if (!pageVisible) {
+      pausePlayer(frameRef.current);
+      return;
+    }
+    if (nativeStartedRef.current && !userPaused) {
+      intentRef.current = { playing: true, muted: false };
+      attemptRef.current = 0;
+      redriveRef.current = 0;
+      if (reportedRef.current.muted) unmutePlayer(frameRef.current);
+      return;
+    }
+    setIntent({
+      playing: !userPaused,
+      muted: false,
+    });
+  }, [awaitGesture, forcePause, gated, nativePlay, pageVisible, role, setIntent, soundEnabled, userPaused]);
+
+  useEffect(() => {
+    const iframe = frameRef.current;
     if (!iframe) return;
 
     const handleMessage = (event: MessageEvent) => {
@@ -237,65 +326,30 @@ export function TikTokEmbed({
       const message = parsePlayerMessage(event.data);
       if (!message) return;
 
+      clearHandshakeTimer();
+
       switch (message.type) {
         case 'onPlayerReady':
-          markReady();
-          setPlayerError(false);
-          playerErrorRef.current = false;
-          if (!userPausedRef.current && isActiveRef.current) {
-            kickPlayback(iframe);
-            scheduleUnmuteRetries(iframe);
-          } else {
-            silencePlayer(iframe);
-          }
+          setReady(true);
+          if (roleRef.current !== 'queued' && !gatedRef.current) reconcile();
           break;
         case 'onPlayerError':
-          playerErrorRef.current = true;
-          setPlayerError(true);
-          clearPlayTimers();
-          clearUnmuteTimers();
+          failLoad('error');
           break;
         case 'onMute':
-          isMutedRef.current = Boolean(message.value);
-          if (isMutedRef.current && isPlayingRef.current && isActiveRef.current) attemptUnmute(iframe);
-          else if (!isMutedRef.current && !isActiveRef.current) mutePlayer(iframe);
-          else if (!isMutedRef.current) clearUnmuteTimers();
+          syncReported({ muted: Boolean(message.value) });
           break;
         case 'onStateChange': {
-          const state = message.value as number;
-          const playing = state === 1;
-
-          if (!isActiveRef.current) {
-            if (playing) silencePlayer(iframe);
-            isPlayingRef.current = false;
-            setIsPlaying(false);
-            break;
-          }
-
-          isPlayingRef.current = playing;
-          setIsPlaying(playing);
-          if (playing) {
-            markReady();
-            clearPlayTimers();
-            scheduleUnmuteRetries(iframe);
-          } else if (
-            !userPausedRef.current
-            && !playerErrorRef.current
-            && !pageHiddenRef.current
-            && (state === 2 || state === 0 || state === 3)
-          ) {
-            kickPlayback(iframe);
-          }
+          const playing = message.value === 1;
+          if (playing) setReady(true);
+          syncReported({ playing });
           break;
         }
         case 'onCurrentTime': {
           const timing = message.value as { currentTime?: number; duration?: number } | undefined;
           if (timing?.currentTime != null) setCurrentTime(timing.currentTime);
           if (timing?.duration != null) setDuration(timing.duration);
-          if (timing?.currentTime != null && timing.currentTime > 0) {
-            markReady();
-            if (isMutedRef.current && isPlayingRef.current && isActiveRef.current) attemptUnmute(iframe);
-          }
+          if (timing?.currentTime != null && timing.currentTime > 0) setReady(true);
           break;
         }
         default:
@@ -305,188 +359,122 @@ export function TikTokEmbed({
 
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  }, [
-    clearPlayTimers,
-    clearUnmuteTimers,
-    isActive,
-    kickPlayback,
-    markReady,
-    scheduleUnmuteRetries,
-    videoId,
-  ]);
+  }, [clearHandshakeTimer, failLoad, notifyNativePlay, reconcile, syncReported, videoId, loadNonce]);
 
   useEffect(() => {
-    if (!isActive || !iframeLoaded || userPaused || playerErrorRef.current) return;
-    const interval = window.setInterval(() => {
-      if (pageHiddenRef.current || userPausedRef.current || isPlayingRef.current || !isActiveRef.current) return;
-      playPlayer(nativeRef.current);
-    }, 300);
-    const stopTimer = window.setTimeout(() => window.clearInterval(interval), 25000);
-    return () => {
-      window.clearInterval(interval);
-      window.clearTimeout(stopTimer);
-    };
-  }, [activationEpoch, iframeLoaded, isActive, userPaused, videoId]);
+    if (!ready) return;
+    onReadyRef.current?.();
+  }, [ready, role, onReady]);
 
-  useEffect(() => {
-    if (!isActive || !iframeLoaded || playerErrorRef.current) return;
-    const startedAt = Date.now();
-    const interval = window.setInterval(() => {
-      if (!isActiveRef.current) {
-        window.clearInterval(interval);
-        return;
-      }
-      if (!isMutedRef.current) {
-        window.clearInterval(interval);
-        return;
-      }
-      attemptUnmute(nativeRef.current);
-      if (Date.now() - startedAt >= UNMUTE_POLL_DURATION_MS) window.clearInterval(interval);
-    }, UNMUTE_POLL_MS);
-    return () => window.clearInterval(interval);
-  }, [activationEpoch, iframeLoaded, isActive, videoId]);
-
-  const handleNativeLoad = useCallback(() => {
-    const iframe = nativeRef.current;
-    if (!iframe || playerErrorRef.current) return;
-    setIframeLoaded(true);
-    if (isActive && !userPausedRef.current) {
-      kickPlayback(iframe);
-      scheduleUnmuteRetries(iframe);
-    } else {
-      silencePlayer(iframe);
-    }
-  }, [isActive, kickPlayback, scheduleUnmuteRetries]);
+  const handleFrameLoad = useCallback(() => {
+    loadedRef.current = true;
+    setLoaded(true);
+    clearHandshakeTimer();
+    handshakeTimerRef.current = window.setTimeout(() => {
+      handshakeTimerRef.current = null;
+      failLoad('silent');
+    }, HANDSHAKE_TIMEOUT_MS);
+    if (roleRef.current !== 'queued' && !gatedRef.current) reconcile();
+  }, [clearHandshakeTimer, failLoad, reconcile]);
 
   const seekTo = useCallback((time: number) => {
     const clamped = Math.max(0, Math.min(time, duration || time));
-    sendPlayerCommand(nativeRef.current, 'seekTo', clamped);
+    seekPlayer(frameRef.current, clamped);
     setCurrentTime(clamped);
   }, [duration]);
 
-  const togglePlayback = useCallback(() => {
-    if (!isActive || !iframeLoaded || playerErrorRef.current) return;
-    const iframe = nativeRef.current;
-    if (!iframe) return;
+  const playFromGesture = useCallback(() => {
+    if (nativeStartedRef.current) return;
+    playPlayer(frameRef.current);
+    unmutePlayer(frameRef.current);
+  }, []);
 
-    if (!userPausedRef.current && isPlayingRef.current) {
-      userPausedRef.current = true;
-      setUserPaused(true);
-      pausePlayer(iframe);
-      isPlayingRef.current = false;
-      setIsPlaying(false);
-      clearPlayTimers();
-      clearUnmuteTimers();
-      return;
-    }
-
-    userPausedRef.current = false;
-    isPlayingRef.current = false;
-    setUserPaused(false);
-    markReady();
-    playPlayer(iframe);
-    schedulePlayRetries(iframe);
-    attemptUnmute(iframe);
-    scheduleUnmuteRetries(iframe);
-  }, [
-    clearPlayTimers,
-    clearUnmuteTimers,
-    iframeLoaded,
-    isActive,
-    markReady,
-    schedulePlayRetries,
-    scheduleUnmuteRetries,
-  ]);
+  const queuedControlsRef = useRef({ play: playFromGesture });
+  queuedControlsRef.current.play = playFromGesture;
 
   useEffect(() => {
-    if (!isActive || !registerActivePlayback) return;
-    registerActivePlayback({ toggle: togglePlayback });
-    return () => registerActivePlayback(null);
-  }, [isActive, registerActivePlayback, togglePlayback]);
+    if (role !== 'queued' || !registerQueuedPlayback) return;
+    const controls = queuedControlsRef.current;
+    registerQueuedPlayback(controls);
+    return () => unregisterQueuedPlayback?.(controls);
+  }, [registerQueuedPlayback, role, unregisterQueuedPlayback]);
 
-  const handleToggle = useCallback((event: SyntheticEvent) => {
-    event.stopPropagation();
-    event.preventDefault();
-    const now = Date.now();
-    if (now - lastToggleAtRef.current < 280) return;
-    lastToggleAtRef.current = now;
-    togglePlayback();
-  }, [togglePlayback]);
+  const togglePlayback = useCallback(() => {
+    if (role !== 'active' || gated || !loaded || unavailableRef.current) return;
+    if (didJustEnableSound()) return;
+    const next = !userPausedRef.current;
+    userPausedRef.current = next;
+    setUserPaused(next);
+    setIntent({ playing: !next, muted: false });
+  }, [gated, loaded, role, setIntent]);
+
+  const activeControlsRef = useRef({ toggle: togglePlayback });
+  activeControlsRef.current.toggle = togglePlayback;
+
+  useEffect(() => {
+    if (role !== 'active' || gated || !registerActivePlayback) return;
+    const controls = activeControlsRef.current;
+    registerActivePlayback(controls);
+    return () => unregisterActivePlayback?.(controls);
+  }, [gated, registerActivePlayback, role, unregisterActivePlayback]);
+
+  const showChrome = role === 'active' && loaded && !gated;
+  const showSpinner = role !== 'queued' && !gated && (!loaded || !ready);
+  const iframeInteractive = (role === 'queued' && awaitGesture)
+    || (role === 'active' && (gated || (loaded && !pauseArmed)));
+  const showPauseHit = role === 'active' && loaded && !gated && pauseArmed;
 
   return (
     <>
       <div className="player-shell">
         <div className="player-frame relative rounded-2xl bg-black shadow-2xl shadow-black/50">
-          {!iframeLoaded && !playerError && (
+          {showSpinner && (
             <div className="player-placeholder absolute inset-0 z-30 flex items-center justify-center bg-black">
               <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-accent" />
             </div>
           )}
 
-          {playerError && (
-            <div className="player-placeholder absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-black px-6 text-center">
-              <p className="text-sm text-muted">This TikTok is gone or blocked embeds.</p>
-              <a
-                href={videoUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="rounded-full bg-accent px-4 py-2 text-sm font-semibold"
-              >
-                Open on TikTok
-              </a>
-            </div>
-          )}
+          <iframe
+            ref={frameRef}
+            key={`${videoId}:${loadNonce}`}
+            src={embedSrc}
+            title="TikTok video"
+            scrolling="no"
+            tabIndex={-1}
+            onLoad={handleFrameLoad}
+            className={`player-iframe player-iframe--native${loaded || role === 'queued' || gated ? ' is-visible' : ''}${iframeInteractive ? ' is-interactive' : ''}`}
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+            referrerPolicy="strict-origin-when-cross-origin"
+            allowFullScreen
+          />
 
-          {!playerError && (
-            <iframe
-              ref={nativeRef}
-              key={videoId}
-              src={embedSrcRef.current}
-              title="TikTok video"
-              scrolling="no"
-              tabIndex={-1}
-              onLoad={handleNativeLoad}
-              className={`player-iframe player-iframe--native${playerVisible ? ' is-visible' : ''}`}
-              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-              referrerPolicy="strict-origin-when-cross-origin"
-              allowFullScreen
+          {showPauseHit && (
+            <button
+              type="button"
+              data-playback-toggle
+              aria-label={userPaused ? 'Play video' : 'Pause video'}
+              className="player-pause-hit"
+              onClick={togglePlayback}
             />
           )}
 
-          {isActive && iframeLoaded && !playerError && (
-            <>
-              <button
-                type="button"
-                data-playback-toggle
-                onPointerDown={(event) => event.stopPropagation()}
-                onClick={handleToggle}
-                className="absolute inset-0 z-40 cursor-pointer touch-manipulation bg-transparent"
-                aria-label={isPlaying ? 'Pause video' : 'Play video'}
-              />
-              {userPaused && (
-                <div className="pointer-events-none absolute inset-0 z-[41] flex items-center justify-center bg-black/20">
-                  <div className="flex h-16 w-16 items-center justify-center rounded-full bg-black/55 text-2xl">
-                    ▶
-                  </div>
-                </div>
-              )}
-              <a
-                href={videoUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                onPointerDown={(event) => event.stopPropagation()}
-                onClick={(event) => event.stopPropagation()}
-                className="absolute right-3 top-3 z-[45] rounded-full bg-black/60 px-2 py-1 text-[11px] font-medium backdrop-blur-sm hover:bg-black/70"
-              >
-                TikTok
-              </a>
-            </>
+          {showChrome && (
+            <a
+              href={videoUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={(event) => event.stopPropagation()}
+              className="absolute right-3 top-3 z-[45] rounded-full bg-black/60 px-2 py-1 text-[11px] font-medium backdrop-blur-sm hover:bg-black/70"
+            >
+              TikTok
+            </a>
           )}
-          {createdDate && <VideoDateOverlay date={createdDate} />}
+          {createdDate && role !== 'queued' && !gated && <VideoDateOverlay date={createdDate} />}
         </div>
       </div>
 
-      {iframeLoaded && !playerError && isActive && (
+      {showChrome && (
         <div className="video-controls rounded-lg border border-white/10 bg-black/80 px-2 py-1 backdrop-blur-sm">
           <div className="flex items-center gap-2">
             <span className="min-w-[2.25rem] shrink-0 text-[10px] tabular-nums text-muted">

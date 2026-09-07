@@ -5,7 +5,10 @@ import {
   type CatalogVideo,
 } from './tiktok';
 
-export function parseVideosTxt(text: string): CatalogVideo[] {
+export function parseVideosTxt(
+  text: string,
+  blockedIds: ReadonlySet<string> = new Set(),
+): CatalogVideo[] {
   const found = new Map<string, CatalogVideo>();
 
   for (const rawLine of text.split(/\r?\n/)) {
@@ -13,7 +16,7 @@ export function parseVideosTxt(text: string): CatalogVideo[] {
     if (!line || line.startsWith('#')) continue;
 
     const id = extractVideoId(line);
-    if (!id || !isTikTokIdFrom2020(id) || found.has(id)) continue;
+    if (!id || !isTikTokIdFrom2020(id) || found.has(id) || blockedIds.has(id)) continue;
 
     found.set(id, {
       id,

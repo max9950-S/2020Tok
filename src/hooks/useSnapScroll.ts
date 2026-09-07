@@ -1,42 +1,42 @@
 import { useEffect, type RefObject } from 'react';
 
-function snapToNearestSlide(container: HTMLElement): number {
-  const slideHeight = container.clientHeight;
-  if (slideHeight <= 0) return 0;
-  const index = Math.round(container.scrollTop / slideHeight);
-  const targetTop = index * slideHeight;
-  if (Math.abs(container.scrollTop - targetTop) > 1) {
-    container.scrollTo({ top: targetTop, behavior: 'auto' });
-  }
-  return index;
-}
+const SETTLE_DELAY_MS = 140;
+const CORRECTION_THRESHOLD_PX = 2;
 
-export function useSnapScroll(
-  containerRef: RefObject<HTMLElement | null>,
-  enabled: boolean,
-  onSnap?: (slideIndex: number) => void,
-): void {
+/**
+ * Desktop-only assist for wheel scrolling. Touch devices are left entirely to CSS
+ * scroll-snap, because a JS scrollTo during iOS momentum fights the native snap and
+ * delays activation. Activation itself lives in the feed's IntersectionObserver.
+ */
+export function useSnapScroll(containerRef: RefObject<HTMLElement | null>, enabled: boolean): void {
   useEffect(() => {
     const container = containerRef.current;
     if (!container || !enabled) return;
+    if (!window.matchMedia('(hover: hover) and (pointer: fine)').matches) return;
 
-    const handleSnap = () => {
-      onSnap?.(snapToNearestSlide(container));
-    };
+    let settleTimer: number | undefined;
 
-    container.addEventListener('scrollend', handleSnap);
-    let scrollTimer: number | undefined;
-    const handleScroll = () => {
+    const correct = () => {
       if (container.classList.contains('is-dragging')) return;
-      window.clearTimeout(scrollTimer);
-      scrollTimer = window.setTimeout(handleSnap, 120);
+      const slideHeight = container.clientHeight;
+      if (slideHeight <= 0) return;
+      const targetTop = Math.round(container.scrollTop / slideHeight) * slideHeight;
+      if (Math.abs(container.scrollTop - targetTop) <= CORRECTION_THRESHOLD_PX) return;
+      container.scrollTo({ top: targetTop, behavior: 'auto' });
     };
+
+    const handleScroll = () => {
+      window.clearTimeout(settleTimer);
+      settleTimer = window.setTimeout(correct, SETTLE_DELAY_MS);
+    };
+
     container.addEventListener('scroll', handleScroll, { passive: true });
+    container.addEventListener('scrollend', correct);
 
     return () => {
-      container.removeEventListener('scrollend', handleSnap);
       container.removeEventListener('scroll', handleScroll);
-      window.clearTimeout(scrollTimer);
+      container.removeEventListener('scrollend', correct);
+      window.clearTimeout(settleTimer);
     };
-  }, [containerRef, enabled, onSnap]);
+  }, [containerRef, enabled]);
 }

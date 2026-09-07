@@ -7,7 +7,8 @@
     "dev": "vite --host",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "dedupe": "node scripts/dedupe-videos.mjs"
+    "dedupe": "node scripts/dedupe-videos.mjs",
+    "check-embeds": "node scripts/check-embeddable.mjs"
   },
   "dependencies": {
     "react": "^19.0.0",
