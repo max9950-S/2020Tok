@@ -13,6 +13,16 @@ interface VideoFeedProps {
   feedRef: RefObject<HTMLDivElement | null>;
 }
 
+type Hit = 'current' | 'up' | 'down' | 'new';
+
+interface Slot {
+  id: number;
+  hit: Hit;
+  slide: FeedSlide | null;
+}
+
+const SLOT_IDS = [0, 1, 2, 3] as const;
+
 function toSlide(video: CatalogVideo, seq: number): FeedSlide {
   return {
     ...video,
@@ -29,6 +39,53 @@ function pickRandom(catalog: CatalogVideo[], history: FeedSlide[], seq: number):
   return toSlide(video, seq);
 }
 
+function desiredSlides(
+  gated: boolean,
+  history: FeedSlide[],
+  index: number,
+  pending: FeedSlide | null,
+): Record<Hit, FeedSlide | null> {
+  if (gated) {
+    return { current: pending, up: null, down: null, new: null };
+  }
+  return {
+    current: history[index] ?? pending,
+    up: history[index - 1] ?? null,
+    down: index < history.length - 1 ? history[index + 1] ?? null : null,
+    new: index === history.length - 1 ? pending : null,
+  };
+}
+
+function assignSlots(prev: Slot[], desired: Record<Hit, FeedSlide | null>): Slot[] {
+  const next: Slot[] = prev.map((slot) => ({ ...slot, slide: null }));
+  const taken = new Set<number>();
+
+  const place = (hit: Hit, slide: FeedSlide | null) => {
+    if (!slide) return;
+    const keep = next.find((slot) => prev[slot.id]?.slide?.slideKey === slide.slideKey);
+    const slot = keep && !taken.has(keep.id)
+      ? keep
+      : next.find((entry) => !taken.has(entry.id));
+    if (!slot) return;
+    slot.hit = hit;
+    slot.slide = slide;
+    taken.add(slot.id);
+  };
+
+  place('current', desired.current);
+  place('up', desired.up);
+  place('down', desired.down);
+  place('new', desired.new);
+  return next;
+}
+
+function sameLayout(prev: Slot[], next: Slot[]): boolean {
+  return prev.every((slot, index) => (
+    slot.hit === next[index].hit
+    && slot.slide?.slideKey === next[index].slide?.slideKey
+  ));
+}
+
 export function VideoFeed({
   catalog,
   onActivated,
@@ -40,23 +97,32 @@ export function VideoFeed({
   const [historyIndex, setHistoryIndex] = useState(0);
   const [gated, setGated] = useState(true);
   const [pending, setPending] = useState<FeedSlide | null>(null);
-  const [current, setCurrent] = useState<FeedSlide | null>(null);
+  const [slots, setSlots] = useState<Slot[]>(() => [
+    { id: 0, hit: 'current', slide: null },
+    { id: 1, hit: 'up', slide: null },
+    { id: 2, hit: 'down', slide: null },
+    { id: 3, hit: 'new', slide: null },
+  ]);
 
   const historyRef = useRef(history);
   const historyIndexRef = useRef(historyIndex);
   const gatedRef = useRef(gated);
   const pendingRef = useRef(pending);
-  const currentRef = useRef(current);
+  const slotsRef = useRef(slots);
   const catalogRef = useRef(catalog);
   const onActivatedRef = useRef(onActivated);
   const activePlaybackRef = useRef<{ toggle: () => void } | null>(null);
   const advancingRef = useRef(false);
+  const hidingRef = useRef(false);
+  const lastHitRef = useRef<'up' | 'down' | 'new' | null>(null);
+  const promoteTimerRef = useRef<number | null>(null);
+  const takeHitRef = useRef<(which: 'up' | 'down' | 'new') => void>(() => {});
 
   historyRef.current = history;
   historyIndexRef.current = historyIndex;
   gatedRef.current = gated;
   pendingRef.current = pending;
-  currentRef.current = current;
+  slotsRef.current = slots;
   catalogRef.current = catalog;
   onActivatedRef.current = onActivated;
 
@@ -78,22 +144,25 @@ export function VideoFeed({
     return value;
   }, []);
 
-  const killCurrentEmbed = useCallback(() => {
-    const frame = feedRef.current?.querySelector('.player-host.is-current iframe');
+  const applyDesired = useCallback((
+    nextHistory: FeedSlide[],
+    nextIndex: number,
+    nextPending: FeedSlide | null,
+    nextGated: boolean,
+  ) => {
+    const desired = desiredSlides(nextGated, nextHistory, nextIndex, nextPending);
+    setSlots((prev) => {
+      const next = assignSlots(prev, desired);
+      return sameLayout(prev, next) ? prev : next;
+    });
+  }, []);
+
+  const blankCurrentIframe = useCallback(() => {
+    const frame = feedRef.current?.querySelector('.player-host.is-current:not(.is-hit) iframe');
     if (frame instanceof HTMLIFrameElement) {
       frame.src = 'about:blank';
     }
-    flushSync(() => {
-      setCurrent(null);
-    });
   }, [feedRef]);
-
-  const showSlide = useCallback((slide: FeedSlide) => {
-    currentRef.current = slide;
-    flushSync(() => {
-      setCurrent(slide);
-    });
-  }, []);
 
   useEffect(() => {
     if (pending) return;
@@ -101,8 +170,18 @@ export function VideoFeed({
     if (!first) return;
     pendingRef.current = first;
     setPending(first);
-    setCurrent(first);
+    setSlots([
+      { id: 0, hit: 'current', slide: first },
+      { id: 1, hit: 'up', slide: null },
+      { id: 2, hit: 'down', slide: null },
+      { id: 3, hit: 'new', slide: null },
+    ]);
   }, [catalog, nextSeq, pending]);
+
+  useEffect(() => {
+    if (advancingRef.current || hidingRef.current) return;
+    applyDesired(history, historyIndex, pending, gated);
+  }, [applyDesired, gated, history, historyIndex, pending]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -130,7 +209,7 @@ export function VideoFeed({
       event.preventDefault();
     };
     const blockTouch = (event: TouchEvent) => {
-      if ((event.target as HTMLElement | null)?.closest('.feed-nav-btn')) return;
+      if ((event.target as HTMLElement | null)?.closest('.feed-nav-btn, .player-host.is-hit')) return;
       event.preventDefault();
     };
     stage.addEventListener('wheel', blockWheel, { passive: false });
@@ -140,6 +219,119 @@ export function VideoFeed({
       stage.removeEventListener('touchmove', blockTouch);
     };
   }, [feedRef]);
+
+  const hideCurrent = useCallback((which: 'up' | 'down' | 'new') => {
+    if (gatedRef.current) return;
+    if (advancingRef.current) return;
+    lastHitRef.current = which;
+    if (hidingRef.current) return;
+    const current = slotsRef.current.find((slot) => slot.hit === 'current');
+    if (!current?.slide) return;
+
+    hidingRef.current = true;
+    blankCurrentIframe();
+    flushSync(() => {
+      setSlots((prev) => prev.map((slot) => (
+        slot.hit === 'current' ? { ...slot, slide: null } : slot
+      )));
+    });
+    if (promoteTimerRef.current !== null) window.clearTimeout(promoteTimerRef.current);
+    promoteTimerRef.current = window.setTimeout(() => {
+      promoteTimerRef.current = null;
+      if (!hidingRef.current) return;
+      const hit = lastHitRef.current;
+      if (hit) takeHitRef.current(hit);
+    }, 350);
+  }, [blankCurrentIframe]);
+
+  const takeHistory = useCallback((direction: 'up' | 'down') => {
+    if (gatedRef.current) return;
+    if (advancingRef.current) return;
+
+    const hit = slotsRef.current.find((slot) => slot.hit === direction);
+    const live = hit?.slide;
+    if (!live) return;
+
+    const list = historyRef.current;
+    const from = historyIndexRef.current;
+    const nextIndex = direction === 'up' ? from - 1 : from + 1;
+    if (nextIndex < 0 || nextIndex >= list.length) return;
+    if (live.slideKey !== list[nextIndex]?.slideKey) return;
+
+    advancingRef.current = true;
+    if (promoteTimerRef.current !== null) {
+      window.clearTimeout(promoteTimerRef.current);
+      promoteTimerRef.current = null;
+    }
+    blankCurrentIframe();
+
+    historyIndexRef.current = nextIndex;
+    hidingRef.current = false;
+    const desired = desiredSlides(false, list, nextIndex, pendingRef.current);
+    flushSync(() => {
+      setHistoryIndex(nextIndex);
+      setSlots((prev) => {
+        const withoutCurrent = prev.map((slot) => (
+          slot.hit === 'current' ? { ...slot, slide: null } : slot
+        ));
+        const next = assignSlots(withoutCurrent, desired);
+        return sameLayout(prev, next) ? prev : next;
+      });
+    });
+    advancingRef.current = false;
+  }, [blankCurrentIframe]);
+
+  const takeHit = useCallback((which: 'up' | 'down' | 'new') => {
+    if (which === 'up' || which === 'down') {
+      takeHistory(which);
+      return;
+    }
+
+    if (gatedRef.current) return;
+    if (advancingRef.current) return;
+
+    const hit = slotsRef.current.find((slot) => slot.hit === which);
+    const live = hit?.slide;
+    if (!live) return;
+
+    const list = historyRef.current;
+    const from = historyIndexRef.current;
+
+    if (list.length === 0 || from !== list.length - 1) return;
+    if (live.slideKey !== pendingRef.current?.slideKey) return;
+    if (list.some((entry) => entry.slideKey === live.slideKey)) return;
+
+    advancingRef.current = true;
+    if (promoteTimerRef.current !== null) {
+      window.clearTimeout(promoteTimerRef.current);
+      promoteTimerRef.current = null;
+    }
+    blankCurrentIframe();
+
+    const nextHistory = [...list, live];
+    const nextIndex = nextHistory.length - 1;
+    const nextPending = pickRandom(catalogRef.current, nextHistory, nextSeq());
+    historyRef.current = nextHistory;
+    historyIndexRef.current = nextIndex;
+    pendingRef.current = nextPending;
+
+    hidingRef.current = false;
+    const desired = desiredSlides(false, nextHistory, nextIndex, nextPending);
+    flushSync(() => {
+      setHistory(nextHistory);
+      setHistoryIndex(nextIndex);
+      setPending(nextPending);
+      setSlots((prev) => {
+        const withoutCurrent = prev.map((slot) => (
+          slot.hit === 'current' ? { ...slot, slide: null } : slot
+        ));
+        const next = assignSlots(withoutCurrent, desired);
+        return sameLayout(prev, next) ? prev : next;
+      });
+    });
+    advancingRef.current = false;
+  }, [blankCurrentIframe, nextSeq, takeHistory]);
+  takeHitRef.current = takeHit;
 
   const startWatching = useCallback(() => {
     if (!gatedRef.current) return;
@@ -158,98 +350,77 @@ export function VideoFeed({
     setPending(following);
   }, [nextSeq]);
 
-  const goNew = useCallback(() => {
-    if (gatedRef.current) return;
-    if (advancingRef.current) return;
-    const list = historyRef.current;
-    if (list.length === 0 || historyIndexRef.current !== list.length - 1) return;
-    const live = pendingRef.current;
-    if (!live) return;
-
-    advancingRef.current = true;
-    killCurrentEmbed();
-
-    const nextHistory = [...list, live];
-    historyRef.current = nextHistory;
-    historyIndexRef.current = nextHistory.length - 1;
-    const following = pickRandom(catalogRef.current, nextHistory, nextSeq());
-    pendingRef.current = following;
-    setHistory(nextHistory);
-    setHistoryIndex(nextHistory.length - 1);
-    setPending(following);
-    showSlide(live);
-    advancingRef.current = false;
-  }, [killCurrentEmbed, nextSeq, showSlide]);
-
-  const goDown = useCallback(() => {
-    if (gatedRef.current) return;
-    if (advancingRef.current) return;
-    const list = historyRef.current;
-    const from = historyIndexRef.current;
-    if (from >= list.length - 1) return;
-    const next = list[from + 1];
-    if (!next) return;
-
-    advancingRef.current = true;
-    killCurrentEmbed();
-    historyIndexRef.current = from + 1;
-    setHistoryIndex(from + 1);
-    showSlide(next);
-    advancingRef.current = false;
-  }, [killCurrentEmbed, showSlide]);
-
-  const goUp = useCallback(() => {
-    if (gatedRef.current) return;
-    if (advancingRef.current) return;
-    const list = historyRef.current;
-    const from = historyIndexRef.current;
-    if (from <= 0) return;
-    const prev = list[from - 1];
-    if (!prev) return;
-
-    advancingRef.current = true;
-    killCurrentEmbed();
-    historyIndexRef.current = from - 1;
-    setHistoryIndex(from - 1);
-    showSlide(prev);
-    advancingRef.current = false;
-  }, [killCurrentEmbed, showSlide]);
-
   useLayoutEffect(() => {
-    if (!gated) return;
     const stage = feedRef.current;
     if (!stage) return;
-    const host = stage.querySelector('.player-host.is-current') as HTMLElement | null;
-    const button = stage.parentElement?.querySelector('.start-gate-button') as HTMLElement | null;
-    if (!host || !button) return;
+
+    if (gated) {
+      const host = stage.querySelector('.player-host.is-current') as HTMLElement | null;
+      const button = stage.parentElement?.querySelector('.start-gate-button') as HTMLElement | null;
+      if (!host || !button) return;
+
+      const sync = () => {
+        const box = button.getBoundingClientRect();
+        const frame = stage.getBoundingClientRect();
+        stage.style.setProperty('--start-hit-top', `${box.top - frame.top}px`);
+        stage.style.setProperty('--start-hit-left', `${box.left - frame.left}px`);
+        stage.style.setProperty('--start-hit-width', `${box.width}px`);
+        stage.style.setProperty('--start-hit-height', `${box.height}px`);
+        host.classList.add('is-start-hit');
+      };
+
+      sync();
+      const observer = new ResizeObserver(sync);
+      observer.observe(button);
+      observer.observe(stage);
+      window.addEventListener('resize', sync);
+      window.visualViewport?.addEventListener('resize', sync);
+      return () => {
+        observer.disconnect();
+        window.removeEventListener('resize', sync);
+        window.visualViewport?.removeEventListener('resize', sync);
+        host.classList.remove('is-start-hit');
+        stage.style.removeProperty('--start-hit-top');
+        stage.style.removeProperty('--start-hit-left');
+        stage.style.removeProperty('--start-hit-width');
+        stage.style.removeProperty('--start-hit-height');
+      };
+    }
+
+    const pairs: Array<[string, string]> = [
+      ['.feed-nav-btn--up', 'up'],
+      ['.feed-nav-btn--down', 'down'],
+      ['.feed-nav-btn--new', 'new'],
+    ];
 
     const sync = () => {
-      const box = button.getBoundingClientRect();
       const frame = stage.getBoundingClientRect();
-      stage.style.setProperty('--start-hit-top', `${box.top - frame.top}px`);
-      stage.style.setProperty('--start-hit-left', `${box.left - frame.left}px`);
-      stage.style.setProperty('--start-hit-width', `${box.width}px`);
-      stage.style.setProperty('--start-hit-height', `${box.height}px`);
-      host.classList.add('is-start-hit');
+      for (const [selector, name] of pairs) {
+        const button = stage.querySelector(selector);
+        if (!(button instanceof HTMLElement)) continue;
+        const box = button.getBoundingClientRect();
+        stage.style.setProperty(`--hit-${name}-top`, `${box.top - frame.top}px`);
+        stage.style.setProperty(`--hit-${name}-left`, `${box.left - frame.left}px`);
+        stage.style.setProperty(`--hit-${name}-width`, `${box.width}px`);
+        stage.style.setProperty(`--hit-${name}-height`, `${box.height}px`);
+      }
     };
 
     sync();
     const observer = new ResizeObserver(sync);
-    observer.observe(button);
     observer.observe(stage);
+    for (const [selector] of pairs) {
+      const button = stage.querySelector(selector);
+      if (button instanceof HTMLElement) observer.observe(button);
+    }
     window.addEventListener('resize', sync);
     window.visualViewport?.addEventListener('resize', sync);
     return () => {
       observer.disconnect();
       window.removeEventListener('resize', sync);
       window.visualViewport?.removeEventListener('resize', sync);
-      host.classList.remove('is-start-hit');
-      stage.style.removeProperty('--start-hit-top');
-      stage.style.removeProperty('--start-hit-left');
-      stage.style.removeProperty('--start-hit-width');
-      stage.style.removeProperty('--start-hit-height');
     };
-  }, [feedRef, gated, current]);
+  }, [feedRef, gated, slots]);
 
   useEffect(() => {
     const ids = new Set(catalog.map((video) => video.id));
@@ -283,36 +454,59 @@ export function VideoFeed({
       className={`feed-stage min-h-0 flex-1 overflow-hidden${gated ? ' is-gated' : ''}`}
     >
       <div className="feed-mover">
-        {current ? (
-          <div className="player-host is-current">
-            <VideoCard slide={current}>
-              <TikTokEmbed
-                key={current.slideKey}
-                videoId={current.id}
-                videoUrl={current.url}
-                role="active"
-                gated={gated}
-                awaitGesture={gated}
-                registerActivePlayback={!gated ? registerActivePlayback : undefined}
-                unregisterActivePlayback={!gated ? unregisterActivePlayback : undefined}
-                onNativePlay={gated ? startWatching : undefined}
-                onUnavailable={onVideoUnavailable}
+        {SLOT_IDS.map((id) => {
+          const slot = slots[id];
+          if (!slot.slide) {
+            return (
+              <div
+                key={slot.id}
+                className={`player-host is-${slot.hit}`}
+                hidden
               />
-            </VideoCard>
-          </div>
-        ) : (
-          <div className="player-host is-current" hidden />
-        )}
+            );
+          }
+
+          const isHit = slot.hit !== 'current';
+          const isCurrent = slot.hit === 'current';
+
+          return (
+            <div
+              key={slot.id}
+              className={`player-host is-${slot.hit}${isHit ? ' is-hit' : ''}`}
+            >
+              <VideoCard slide={slot.slide}>
+                <TikTokEmbed
+                  key={slot.slide.slideKey}
+                  videoId={slot.slide.id}
+                  videoUrl={slot.slide.url}
+                  role={isHit ? 'queued' : 'active'}
+                  gated={gated || isHit}
+                  awaitGesture={gated || isHit}
+                  registerActivePlayback={isCurrent && !gated ? registerActivePlayback : undefined}
+                  unregisterActivePlayback={isCurrent && !gated ? unregisterActivePlayback : undefined}
+                  onGestureStart={isHit ? () => hideCurrent(slot.hit as 'up' | 'down' | 'new') : undefined}
+                  onNativePlay={
+                    isHit
+                      ? () => takeHit(slot.hit as 'up' | 'down' | 'new')
+                      : gated && isCurrent
+                        ? startWatching
+                        : undefined
+                  }
+                  onUnavailable={onVideoUnavailable}
+                />
+              </VideoCard>
+            </div>
+          );
+        })}
       </div>
 
       <div className="feed-nav">
         <div className="feed-nav-history">
           <button
             type="button"
-            className="feed-nav-btn feed-nav-btn--up"
+            className={`feed-nav-btn feed-nav-btn--up${hasPrev ? ' is-passthrough' : ''}`}
             aria-label="Previous watched video"
             disabled={!hasPrev}
-            onClick={goUp}
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M6 14.5 12 8.5l6 6" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
@@ -320,10 +514,9 @@ export function VideoFeed({
           </button>
           <button
             type="button"
-            className="feed-nav-btn feed-nav-btn--down"
+            className={`feed-nav-btn feed-nav-btn--down${hasHistoryNext ? ' is-passthrough' : ''}`}
             aria-label="Next watched video"
             disabled={!hasHistoryNext}
-            onClick={goDown}
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M6 9.5 12 15.5l6-6" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
@@ -332,10 +525,9 @@ export function VideoFeed({
         </div>
         <button
           type="button"
-          className="feed-nav-btn feed-nav-btn--new"
+          className={`feed-nav-btn feed-nav-btn--new${canStartNew ? ' is-passthrough' : ''}`}
           aria-label="Start a new random video"
           disabled={!canStartNew}
-          onClick={goNew}
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M8 5.5v13l11-6.5z" fill="currentColor" />

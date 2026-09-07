@@ -253,6 +253,89 @@ body {
   z-index: 2;
 }
 
+.feed-stage:has(.player-host.is-hit:focus-within) .player-host.is-current:not(.is-hit) {
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
+.player-host.is-hit {
+  overflow: hidden;
+  clip-path: inset(0);
+  border-radius: 0;
+  z-index: 80;
+  pointer-events: auto;
+  touch-action: manipulation;
+  cursor: pointer;
+  right: auto !important;
+  bottom: auto !important;
+  transform: none !important;
+}
+
+.player-host.is-hit-up,
+.player-host.is-up.is-hit {
+  top: var(--hit-up-top) !important;
+  left: var(--hit-up-left) !important;
+  width: var(--hit-up-width) !important;
+  height: var(--hit-up-height) !important;
+  z-index: 100;
+}
+
+.player-host.is-hit-down,
+.player-host.is-down.is-hit {
+  top: var(--hit-down-top) !important;
+  left: var(--hit-down-left) !important;
+  width: var(--hit-down-width) !important;
+  height: var(--hit-down-height) !important;
+  z-index: 100;
+}
+
+.player-host.is-hit-new,
+.player-host.is-new.is-hit {
+  top: var(--hit-new-top) !important;
+  left: var(--hit-new-left) !important;
+  width: var(--hit-new-width) !important;
+  height: var(--hit-new-height) !important;
+}
+
+.player-host.is-hit .feed-slide,
+.player-host.is-hit .feed-slide-content,
+.player-host.is-hit .video-stack,
+.player-host.is-hit .video-player-block,
+.player-host.is-hit .player-slot,
+.player-host.is-hit .player-shell,
+.player-host.is-hit .player-frame {
+  height: 100%;
+  min-height: 0;
+  max-height: none;
+  padding: 0;
+  margin: 0;
+  gap: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.player-host.is-hit .video-embed-column {
+  display: block;
+  height: 100%;
+}
+
+.player-host.is-hit .player-iframe {
+  width: var(--viewport-width);
+  height: var(--feed-height);
+  inset: auto;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  opacity: 0.01;
+  pointer-events: auto;
+}
+
+.player-host.is-hit .video-controls,
+.player-host.is-hit .player-placeholder,
+.player-host.is-hit .player-pause-hit {
+  display: none;
+}
+
 .player-host.is-prev {
   top: -100% !important;
   left: 0 !important;
@@ -418,7 +501,9 @@ body {
   transform: scale(0.9);
 }
 
-.feed-nav-btn--new.is-passthrough {
+.feed-nav-btn--new.is-passthrough,
+.feed-nav-btn--up.is-passthrough,
+.feed-nav-btn--down.is-passthrough {
   pointer-events: none;
 }
 

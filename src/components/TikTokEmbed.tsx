@@ -35,6 +35,7 @@ interface TikTokEmbedProps {
   registerQueuedPlayback?: (controls: { play: () => void } | null) => void;
   unregisterQueuedPlayback?: (controls: { play: () => void }) => void;
   onNativePlay?: () => void;
+  onGestureStart?: () => void;
   onReady?: () => void;
   onUnavailable?: (videoId: string) => void;
 }
@@ -68,6 +69,7 @@ export function TikTokEmbed({
   registerQueuedPlayback,
   unregisterQueuedPlayback,
   onNativePlay,
+  onGestureStart,
   onReady,
   onUnavailable,
 }: TikTokEmbedProps) {
@@ -106,12 +108,14 @@ export function TikTokEmbed({
   const gatedRef = useRef(gated);
   const forcePauseRef = useRef(forcePause);
   const onNativePlayRef = useRef(onNativePlay);
+  const onGestureStartRef = useRef(onGestureStart);
   const onReadyRef = useRef(onReady);
   const awaitGestureRef = useRef(awaitGesture);
   roleRef.current = role;
   gatedRef.current = gated;
   forcePauseRef.current = forcePause;
   onNativePlayRef.current = onNativePlay;
+  onGestureStartRef.current = onGestureStart;
   onReadyRef.current = onReady;
   awaitGestureRef.current = awaitGesture;
 
@@ -366,6 +370,12 @@ export function TikTokEmbed({
     onReadyRef.current?.();
   }, [ready, role, onReady]);
 
+  const handleGestureStart = useCallback(() => {
+    if (!awaitGestureRef.current) return;
+    if (roleRef.current !== 'queued') return;
+    onGestureStartRef.current?.();
+  }, []);
+
   const handleFrameLoad = useCallback(() => {
     loadedRef.current = true;
     setLoaded(true);
@@ -441,6 +451,8 @@ export function TikTokEmbed({
             title="TikTok video"
             scrolling="no"
             tabIndex={-1}
+            onFocus={handleGestureStart}
+            onPointerDown={handleGestureStart}
             onLoad={handleFrameLoad}
             className={`player-iframe player-iframe--native${loaded || role === 'queued' || gated ? ' is-visible' : ''}${iframeInteractive ? ' is-interactive' : ''}`}
             allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
