@@ -220,6 +220,17 @@ export function VideoFeed({
     };
   }, [feedRef]);
 
+  const recoverLayout = useCallback(() => {
+    hidingRef.current = false;
+    advancingRef.current = false;
+    lastHitRef.current = null;
+    if (promoteTimerRef.current !== null) {
+      window.clearTimeout(promoteTimerRef.current);
+      promoteTimerRef.current = null;
+    }
+    applyDesired(historyRef.current, historyIndexRef.current, pendingRef.current, gatedRef.current);
+  }, [applyDesired]);
+
   const hideCurrent = useCallback((which: 'up' | 'down' | 'new') => {
     if (gatedRef.current) return;
     if (advancingRef.current) return;
@@ -241,22 +252,24 @@ export function VideoFeed({
       if (!hidingRef.current) return;
       const hit = lastHitRef.current;
       if (hit) takeHitRef.current(hit);
+      if (hidingRef.current) recoverLayout();
     }, 350);
-  }, [blankCurrentIframe]);
+  }, [blankCurrentIframe, recoverLayout]);
 
   const takeHistory = useCallback((direction: 'up' | 'down') => {
-    if (gatedRef.current) return;
+    if (gatedRef.current) {
+      recoverLayout();
+      return;
+    }
     if (advancingRef.current) return;
-
-    const hit = slotsRef.current.find((slot) => slot.hit === direction);
-    const live = hit?.slide;
-    if (!live) return;
 
     const list = historyRef.current;
     const from = historyIndexRef.current;
     const nextIndex = direction === 'up' ? from - 1 : from + 1;
-    if (nextIndex < 0 || nextIndex >= list.length) return;
-    if (live.slideKey !== list[nextIndex]?.slideKey) return;
+    if (nextIndex < 0 || nextIndex >= list.length) {
+      recoverLayout();
+      return;
+    }
 
     advancingRef.current = true;
     if (promoteTimerRef.current !== null) {
@@ -279,7 +292,7 @@ export function VideoFeed({
       });
     });
     advancingRef.current = false;
-  }, [blankCurrentIframe]);
+  }, [blankCurrentIframe, recoverLayout]);
 
   const takeHit = useCallback((which: 'up' | 'down' | 'new') => {
     if (which === 'up' || which === 'down') {
@@ -287,19 +300,26 @@ export function VideoFeed({
       return;
     }
 
-    if (gatedRef.current) return;
-    if (advancingRef.current) return;
+    if (gatedRef.current || advancingRef.current) {
+      recoverLayout();
+      return;
+    }
 
     const hit = slotsRef.current.find((slot) => slot.hit === which);
     const live = hit?.slide;
-    if (!live) return;
-
     const list = historyRef.current;
     const from = historyIndexRef.current;
 
-    if (list.length === 0 || from !== list.length - 1) return;
-    if (live.slideKey !== pendingRef.current?.slideKey) return;
-    if (list.some((entry) => entry.slideKey === live.slideKey)) return;
+    if (
+      !live
+      || list.length === 0
+      || from !== list.length - 1
+      || live.slideKey !== pendingRef.current?.slideKey
+      || list.some((entry) => entry.slideKey === live.slideKey)
+    ) {
+      recoverLayout();
+      return;
+    }
 
     advancingRef.current = true;
     if (promoteTimerRef.current !== null) {
@@ -484,7 +504,13 @@ export function VideoFeed({
                   awaitGesture={gated || isHit}
                   registerActivePlayback={isCurrent && !gated ? registerActivePlayback : undefined}
                   unregisterActivePlayback={isCurrent && !gated ? unregisterActivePlayback : undefined}
-                  onGestureStart={isHit ? () => hideCurrent(slot.hit as 'up' | 'down' | 'new') : undefined}
+                  onGestureStart={
+                    isHit
+                      ? () => hideCurrent(slot.hit as 'up' | 'down' | 'new')
+                      : gated && isCurrent
+                        ? startWatching
+                        : undefined
+                  }
                   onNativePlay={
                     isHit
                       ? () => takeHit(slot.hit as 'up' | 'down' | 'new')

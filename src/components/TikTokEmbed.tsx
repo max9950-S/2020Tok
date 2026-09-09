@@ -372,7 +372,7 @@ export function TikTokEmbed({
 
   const handleGestureStart = useCallback(() => {
     if (!awaitGestureRef.current) return;
-    if (roleRef.current !== 'queued') return;
+    if (roleRef.current !== 'queued' && !(roleRef.current === 'active' && gatedRef.current)) return;
     onGestureStartRef.current?.();
   }, []);
 
