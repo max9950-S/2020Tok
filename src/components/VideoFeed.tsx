@@ -62,7 +62,10 @@ function assignSlots(prev: Slot[], desired: Record<Hit, FeedSlide | null>): Slot
 
   const place = (hit: Hit, slide: FeedSlide | null) => {
     if (!slide) return;
-    const keep = next.find((slot) => prev[slot.id]?.slide?.slideKey === slide.slideKey);
+    const keep = next.find((slot) => (
+      !taken.has(slot.id)
+      && prev.find((entry) => entry.id === slot.id)?.slide?.slideKey === slide.slideKey
+    ));
     const slot = keep && !taken.has(keep.id)
       ? keep
       : next.find((entry) => !taken.has(entry.id));
@@ -76,6 +79,19 @@ function assignSlots(prev: Slot[], desired: Record<Hit, FeedSlide | null>): Slot
   place('up', desired.up);
   place('down', desired.down);
   place('new', desired.new);
+
+  const usedHits = new Set(
+    next.filter((slot) => taken.has(slot.id)).map((slot) => slot.hit),
+  );
+  const leftoverHits: Hit[] = (['current', 'up', 'down', 'new'] as const)
+    .filter((hit) => !usedHits.has(hit));
+  let leftoverIndex = 0;
+  for (const slot of next) {
+    if (taken.has(slot.id)) continue;
+    slot.slide = null;
+    slot.hit = leftoverHits[leftoverIndex] ?? 'down';
+    leftoverIndex += 1;
+  }
   return next;
 }
 
@@ -236,14 +252,14 @@ export function VideoFeed({
     if (advancingRef.current) return;
     lastHitRef.current = which;
     if (hidingRef.current) return;
-    const current = slotsRef.current.find((slot) => slot.hit === 'current');
+    const current = slotsRef.current.find((slot) => slot.hit === 'current' && slot.slide);
     if (!current?.slide) return;
 
     hidingRef.current = true;
     blankCurrentIframe();
     flushSync(() => {
       setSlots((prev) => prev.map((slot) => (
-        slot.hit === 'current' ? { ...slot, slide: null } : slot
+        slot.hit === 'current' && slot.slide ? { ...slot, slide: null } : slot
       )));
     });
     if (promoteTimerRef.current !== null) window.clearTimeout(promoteTimerRef.current);
@@ -285,10 +301,9 @@ export function VideoFeed({
       setHistoryIndex(nextIndex);
       setSlots((prev) => {
         const withoutCurrent = prev.map((slot) => (
-          slot.hit === 'current' ? { ...slot, slide: null } : slot
+          slot.hit === 'current' && slot.slide ? { ...slot, slide: null } : slot
         ));
-        const next = assignSlots(withoutCurrent, desired);
-        return sameLayout(prev, next) ? prev : next;
+        return assignSlots(withoutCurrent, desired);
       });
     });
     advancingRef.current = false;
@@ -300,12 +315,13 @@ export function VideoFeed({
       return;
     }
 
-    if (gatedRef.current || advancingRef.current) {
+    if (advancingRef.current) return;
+    if (gatedRef.current) {
       recoverLayout();
       return;
     }
 
-    const hit = slotsRef.current.find((slot) => slot.hit === which);
+    const hit = slotsRef.current.find((slot) => slot.hit === which && slot.slide);
     const live = hit?.slide;
     const list = historyRef.current;
     const from = historyIndexRef.current;
@@ -343,14 +359,13 @@ export function VideoFeed({
       setPending(nextPending);
       setSlots((prev) => {
         const withoutCurrent = prev.map((slot) => (
-          slot.hit === 'current' ? { ...slot, slide: null } : slot
+          slot.hit === 'current' && slot.slide ? { ...slot, slide: null } : slot
         ));
-        const next = assignSlots(withoutCurrent, desired);
-        return sameLayout(prev, next) ? prev : next;
+        return assignSlots(withoutCurrent, desired);
       });
     });
     advancingRef.current = false;
-  }, [blankCurrentIframe, nextSeq, takeHistory]);
+  }, [blankCurrentIframe, nextSeq, recoverLayout, takeHistory]);
   takeHitRef.current = takeHit;
 
   const startWatching = useCallback(() => {
@@ -460,6 +475,14 @@ export function VideoFeed({
       return replacement;
     });
   }, [catalog, nextSeq]);
+
+  useEffect(() => {
+    if (gated || hidingRef.current || advancingRef.current) return;
+    const hasCurrent = slots.some((slot) => slot.hit === 'current' && slot.slide);
+    if (hasCurrent) return;
+    if (history.length === 0 && !pending) return;
+    recoverLayout();
+  }, [gated, history.length, pending, recoverLayout, slots]);
 
   if (catalog.length === 0) return null;
 
