@@ -248,6 +248,29 @@ export function VideoFeed({
     applyDesired(historyRef.current, historyIndexRef.current, pendingRef.current, gatedRef.current);
   }, [applyDesired]);
 
+  const armPlayIframe = useCallback((slide?: FeedSlide | null) => {
+    hidingRef.current = false;
+    advancingRef.current = false;
+    lastHitRef.current = null;
+    playLockUntilRef.current = 0;
+    if (promoteTimerRef.current !== null) {
+      window.clearTimeout(promoteTimerRef.current);
+      promoteTimerRef.current = null;
+    }
+    const pending = slide ?? pendingRef.current;
+    if (pending) pendingRef.current = pending;
+    const desired = desiredSlides(
+      false,
+      historyRef.current,
+      historyIndexRef.current,
+      pending,
+    );
+    flushSync(() => {
+      if (pending) setPending(pending);
+      setSlots((prev) => assignSlots(prev, desired));
+    });
+  }, []);
+
   const hideCurrent = useCallback((which: 'up' | 'down' | 'new') => {
     if (gatedRef.current) return;
     if (advancingRef.current) return;
@@ -270,9 +293,16 @@ export function VideoFeed({
       if (!hidingRef.current) return;
       const hit = lastHitRef.current;
       if (hit) takeHitRef.current(hit);
-      if (hidingRef.current) recoverLayout();
+      if (!hidingRef.current) return;
+      if (hit === 'new') {
+        const playSlide = slotsRef.current.find((slot) => slot.hit === 'new' && slot.slide)?.slide
+          ?? pendingRef.current;
+        armPlayIframe(playSlide);
+        return;
+      }
+      recoverLayout();
     }, 350);
-  }, [blankCurrentIframe, recoverLayout]);
+  }, [armPlayIframe, blankCurrentIframe, recoverLayout]);
 
   const takeHistory = useCallback((direction: 'up' | 'down') => {
     if (gatedRef.current) {
@@ -314,23 +344,26 @@ export function VideoFeed({
   const takeNew = useCallback(() => {
     if (gatedRef.current) return;
     if (advancingRef.current) return;
-    if (performance.now() < playLockUntilRef.current) return;
+    if (performance.now() < playLockUntilRef.current) {
+      if (hidingRef.current) armPlayIframe();
+      return;
+    }
 
     const live = slotsRef.current.find((slot) => slot.hit === 'new' && slot.slide)?.slide
       ?? pendingRef.current;
     if (!live) {
-      hidingRef.current = false;
-      recoverLayout();
+      armPlayIframe();
       return;
     }
 
     const list = historyRef.current;
+    const from = historyIndexRef.current;
     const existing = list.findIndex((entry) => entry.slideKey === live.slideKey);
-    if (existing >= 0 && existing === historyIndexRef.current && !hidingRef.current) {
+    if (existing >= 0 && existing === from) {
+      armPlayIframe(live);
       return;
     }
 
-    playLockUntilRef.current = performance.now() + 500;
     advancingRef.current = true;
     if (promoteTimerRef.current !== null) {
       window.clearTimeout(promoteTimerRef.current);
@@ -340,6 +373,7 @@ export function VideoFeed({
 
     const nextHistory = existing >= 0 ? list : [...list, live];
     const nextIndex = existing >= 0 ? existing : nextHistory.length - 1;
+    const previousPending = pendingRef.current;
     const nextPending = live.slideKey === pendingRef.current?.slideKey
       ? pickRandom(catalogRef.current, nextHistory, nextSeq())
       : pendingRef.current ?? pickRandom(catalogRef.current, nextHistory, nextSeq());
@@ -362,7 +396,22 @@ export function VideoFeed({
       });
     });
     advancingRef.current = false;
-  }, [blankCurrentIframe, nextSeq, recoverLayout]);
+
+    const current = slotsRef.current.find((slot) => slot.hit === 'current' && slot.slide);
+    if (current?.slide?.slideKey !== live.slideKey) {
+      historyRef.current = list;
+      historyIndexRef.current = from;
+      pendingRef.current = live;
+      flushSync(() => {
+        setHistory(list);
+        setHistoryIndex(from);
+        setPending(previousPending ?? live);
+      });
+      armPlayIframe(live);
+      return;
+    }
+    playLockUntilRef.current = performance.now() + 500;
+  }, [armPlayIframe, blankCurrentIframe, nextSeq]);
 
   const takeHit = useCallback((which: 'up' | 'down' | 'new') => {
     if (which === 'new') {
